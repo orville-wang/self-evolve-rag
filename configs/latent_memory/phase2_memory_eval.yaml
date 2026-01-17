@@ -1,0 +1,65 @@
+model:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  load_model_path: null
+  max_prompt_aug_num: 2
+  max_inference_aug_num: 0
+
+  weaver:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    prompt_latents_len: 2
+    inference_latents_len: 2
+    lora_config:
+      r: 8
+      lora_alpha: 16
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+  trigger:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    active: False
+    lora_config:
+      r: 8
+      lora_alpha: 16
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+dataset:
+    name: triviaqa
+    mode: sft
+    sft:
+      valid_ratio: 0.1
+    grpo:
+      valid_ratio: 0.1
+
+run:
+  seed: 42
+  mode: eval
+  train_weaver: False
+  train_weaver_method: sft
+  train_trigger: False
+  train_trigger_method: grpo
+
+  generation:
+    max_turns: 2
+    max_start_length: 256
+    max_prompt_length: 512
+    max_response_length: 128
+    max_obs_length: 128
+    temperature: 0.7
+    eval_batch_size: 1
+
+# Phase 2: Memory-enhanced evaluation
+memory:
+  enable: true  # Enable memory retrieval
+  store_path: /root/autodl-tmp/real_experience.jsonl
+  index_type: simple
+  topk: 1
+  min_score: 0.3
+  writeback:
+    enable: false  # No writeback during evaluation
+    min_reward: 0.6
+    require_grounding: false

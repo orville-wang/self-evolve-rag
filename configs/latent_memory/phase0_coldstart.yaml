@@ -1,0 +1,66 @@
+model:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  load_model_path: null
+  max_prompt_aug_num: 4  # Reduced from 8
+  max_inference_aug_num: 0
+
+  weaver:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    prompt_latents_len: 4  # Reduced from 8
+    inference_latents_len: 4  # Reduced from 8
+
+    lora_config:
+      r: 8  # Reduced from 16
+      lora_alpha: 16  # Reduced from 32
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+  trigger:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    active: False
+    lora_config:
+      r: 8
+      lora_alpha: 16
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+dataset:
+    name: triviaqa
+    mode: sft
+    sft:
+      valid_ratio: 0.1
+    grpo:
+      valid_ratio: 0.1
+
+run:
+  seed: 42
+  mode: eval  # Evaluation mode for Phase 0
+  train_weaver: False
+  train_weaver_method: sft
+  train_trigger: False
+  train_trigger_method: grpo
+
+  generation:
+    max_turns: 3  # Reduced from 5
+    max_start_length: 128  # Reduced from 256
+    max_prompt_length: 1024  # Reduced from 2048
+    max_response_length: 128  # Reduced from 256
+    max_obs_length: 128  # Reduced from 256
+    temperature: 0.7
+    eval_batch_size: 1
+
+# Phase 0: Build initial experience store (no memory retrieval, only writeback)
+memory:
+  enable: false  # No retrieval during cold-start
+  store_path: /root/autodl-tmp/initial_experience.jsonl
+  index_type: simple
+  topk: 1
+  min_score: 0.3
+  writeback:
+    enable: true  # Enable writeback to collect experiences
+    min_reward: 0.6
+    require_grounding: false

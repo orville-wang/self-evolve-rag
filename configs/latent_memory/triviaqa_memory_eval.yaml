@@ -1,0 +1,78 @@
+model:
+  # base llm
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  load_model_path: null
+
+  # max prompt/inference augmentation num
+  max_prompt_aug_num: 8  # single turn
+  max_inference_aug_num: 0
+
+  # weaver configs
+  weaver:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    prompt_latents_len: 8
+    inference_latents_len: 8
+
+    lora_config:
+      r: 16
+      lora_alpha: 32
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+  # trigger configs
+  trigger:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    active: False
+
+    lora_config:
+      r: 16
+      lora_alpha: 32
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+dataset:
+    name: triviaqa
+    mode: sft
+    sft:
+      valid_ratio: 0.1
+    grpo:
+      valid_ratio: 0.1
+
+
+# training/evaluation configs
+run:
+
+  seed: 42
+
+  # route
+  mode: eval
+  train_weaver: False
+  train_weaver_method: sft    # sft or grpo
+  train_trigger: False
+  train_trigger_method: grpo  # grpo only
+
+  # generation config for evaluation
+  generation:
+    max_turns: 5
+    max_start_length: 256
+    max_prompt_length: 4096
+    max_response_length: 1024
+    max_obs_length: 512
+    temperature: 0.5
+    eval_batch_size: 8
+
+# Enable memory for memory-enhanced evaluation
+memory:
+  enable: true
+  store_path: /root/autodl-tmp/experience.jsonl
+  index_type: simple
+  topk: 1
+  min_score: 0.25
+  writeback:
+    enable: true
+    min_reward: 0.8
+    require_grounding: false

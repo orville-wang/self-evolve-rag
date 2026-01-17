@@ -64,7 +64,35 @@ class MemGenRunner:
         self.trigger_train_dataset = self._filter_dataset(self.trigger_train_dataset)
         self.weaver_valid_dataset = self._filter_dataset(self.weaver_valid_dataset)
         self.trigger_valid_dataset = self._filter_dataset(self.trigger_valid_dataset)
-        
+
+        # initialize memory store (optional)
+        memory_cfg = config.get("memory") or {}
+        self.memory_cfg = memory_cfg
+        self.experience_store = None
+        self.memory_writer = None
+        self.writeback_enabled = False
+        if memory_cfg.get("enable", False):
+            from memgen.memory import ExperienceStore, MemoryWriter
+
+            store_path = memory_cfg.get("store_path") or "experience.jsonl"
+            if not os.path.isabs(store_path):
+                store_path = os.path.join(self.working_dir, store_path)
+
+            self.experience_store = ExperienceStore(
+                store_path=store_path,
+                index_type=memory_cfg.get("index_type", "simple"),
+                topk=memory_cfg.get("topk", 4),
+                min_score=memory_cfg.get("min_score", 0.25),
+            )
+
+            writeback_cfg = memory_cfg.get("writeback", {}) or {}
+            self.writeback_enabled = writeback_cfg.get("enable", False)
+            if self.writeback_enabled:
+                self.memory_writer = MemoryWriter(
+                    min_reward=writeback_cfg.get("min_reward", 0.8),
+                    require_grounding=writeback_cfg.get("require_grounding", True),
+                )
+
         # initialize generation manager
         if self.env_cls.ENV_CARD == "STATIC":
             self.inter_cls = SingleTurnInteractionManager
@@ -74,7 +102,10 @@ class MemGenRunner:
             raise ValueError("Unsupported environment type.")
         
         self.generation_manager: InteractionManager = self.inter_cls(
-            self.processing_class, self.model, self.interaction_config
+            self.processing_class,
+            self.model,
+            self.interaction_config,
+            memory_store=self.experience_store,
         )
     
     def _parse_train_dataset(self, train_dataset: Dataset) -> tuple[Dataset, Dataset]:
@@ -101,7 +132,8 @@ class MemGenRunner:
         elif self.train_trigger and self.train_trigger_method == "grpo":
             max_len = self.trigger_grpo_training_args.max_prompt_length
         else:
-            raise ValueError("Wrong training mode.")
+            # In evaluation mode, use default max_len
+            max_len = 1024
 
         # Function to filter out samples exceeding max length
         def filter_func(sample):
@@ -275,9 +307,15 @@ class MemGenRunner:
                 completion_ids = gen_output.batch["responses"]
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
+            if self.writeback_enabled:
+                rewards = self._compute_batch_rewards(completions, test_batch)
+                queries = [example.get("prompt", "") for example in test_batch]
+                self._writeback_batch(queries, completions, rewards)
+
             recorder.record_batch(completions, test_batch)
         recorder.finalize()
         writer.close()
+        self._save_experience_store()
 
 
     def _dynamic_evaluate(self):
@@ -352,10 +390,17 @@ class MemGenRunner:
                 reward = env.feedback()
                 rewards.append(reward)
             
+            if self.writeback_enabled:
+                queries = [
+                    env.task_config.get("prompt", "") for env in input_data_proto.no_tensor_batch["envs"]
+                ]
+                self._writeback_batch(queries, inter_context, rewards)
+
             recorder.record_batch(inter_context, rewards)
         
         recorder.finalize()
         writer.close()
+        self._save_experience_store()
     
     def _parse_configs(self, configs):
         
@@ -401,3 +446,29 @@ class MemGenRunner:
             batch_size=interaction_configs.get("batch_size", 32),
             output_dir=os.path.join(self.working_dir, "evaluate")
         )
+
+    def _compute_batch_rewards(self, completions: list[str], examples: list[dict]) -> list[float]:
+        if not examples:
+            return []
+        reward_kwargs = {key: [example[key] for example in examples] for key in examples[0]}
+        reward_kwargs["completions"] = completions
+        return self.env_cls.compute_reward(**reward_kwargs)
+
+    def _writeback_batch(self, queries: list[str], completions: list[str], rewards: list[float]) -> None:
+        if not self.writeback_enabled or self.memory_writer is None or self.experience_store is None:
+            return
+        task_type = self.config.get("dataset", {}).get("name", "unknown")
+        for query, completion, reward in zip(queries, completions, rewards):
+            if self.memory_writer.should_write(reward, has_grounding=True):
+                entry = self.memory_writer.create_entry(
+                    query=query,
+                    answer=completion,
+                    reward=reward,
+                    task_type=task_type,
+                )
+                self.experience_store.add(entry)
+
+    def _save_experience_store(self) -> None:
+        if self.experience_store is None or not self.writeback_enabled:
+            return
+        self.experience_store.save()

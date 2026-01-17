@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 from interactions.tensor_utils import TensorHelper, TensorConfig
 
@@ -30,12 +30,14 @@ class InteractionManager(ABC):
         actor_rollout_wg,
         config: InteractionConfig,
         is_validation: bool = False,
+        memory_store: Optional[object] = None,
     ):
         self.tokenizer = tokenizer
         self.tokenizer.padding_side = "left" 
         self.actor_rollout_wg = actor_rollout_wg
         self.config = config
         self.is_validation = is_validation
+        self.memory_store = memory_store
         
         assert tokenizer.pad_token_id is not None
         self.tensor_fn = TensorHelper(TensorConfig(
@@ -44,6 +46,22 @@ class InteractionManager(ABC):
             max_obs_length=config.max_obs_length,
             max_start_length=config.max_start_length
         ))
+
+    def _lookup_memory_texts(self, queries: List[str]) -> List[Optional[str]]:
+        if self.memory_store is None:
+            return [None] * len(queries)
+
+        memory_texts: List[Optional[str]] = []
+        for query in queries:
+            if not query:
+                memory_texts.append(None)
+                continue
+            memories = self.memory_store.search(query, topk=1)
+            if memories:
+                memory_texts.append(memories[0].get("text"))
+            else:
+                memory_texts.append(None)
+        return memory_texts
     
     @abstractmethod
     def run_agent_loop(self, gen_batch: InteractionDataProto) -> InteractionDataProto:

@@ -1,0 +1,115 @@
+model:
+  # base llm
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  load_model_path: null
+
+  # max prompt/inference augmentation num
+  max_prompt_aug_num: 8
+  max_inference_aug_num: 0
+
+  # weaver configs
+  weaver:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    prompt_latents_len: 8
+    inference_latents_len: 8
+
+    lora_config:
+      r: 16
+      lora_alpha: 32
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+  # trigger configs
+  trigger:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    active: False
+
+    lora_config:
+      r: 16
+      lora_alpha: 32
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+dataset:
+    name: triviaqa
+    mode: grpo
+    sft:
+      valid_ratio: 0.1
+    grpo:
+      valid_ratio: 0.1
+
+# training/evaluation configs
+run:
+
+  seed: 42
+
+  # route
+  mode: train
+  train_weaver: True
+  train_weaver_method: grpo
+  train_trigger: False
+  train_trigger_method: grpo
+
+  # processor training configs
+  weaver:
+
+    # grpo configs for small-scale test
+    grpo:
+      num_train_epochs: 1  # Only 1 epoch for quick test
+      per_device_train_batch_size: 2  # Small batch
+      per_device_eval_batch_size: 2
+      num_generations: 4  # Fewer generations
+      num_iterations: 1
+      gradient_accumulation_steps: 2
+      beta: 0.01
+      loss_type: grpo
+
+      max_prompt_length: 1024
+      max_completion_length: 256  # Shorter completions
+      temperature: 0.7
+
+      # optimizer configs
+      optim: adamw_torch
+      lr_scheduler_type: cosine
+      warmup_ratio: 0.1
+      learning_rate: 5e-6
+
+      # duration
+      logging_strategy: steps
+      logging_steps: 5
+      eval_strategy: steps
+      eval_steps: 50
+      save_strategy: steps
+      save_steps: 50
+
+      remove_unused_columns: False
+      load_best_model_at_end: True
+      bf16: True
+      report_to:
+        - tensorboard
+
+  # generation config
+  generation:
+    max_turns: 5
+    max_start_length: 256
+    max_prompt_length: 2048
+    max_response_length: 256
+    max_obs_length: 256
+    temperature: 0.7
+    eval_batch_size: 2
+
+# Memory configuration for small-scale test
+memory:
+  enable: true
+  store_path: /root/autodl-tmp/test_experience.jsonl
+  index_type: simple
+  topk: 1
+  min_score: 0.3
+  writeback:
+    enable: true
+    min_reward: 0.6  # Lower threshold for test
+    require_grounding: false

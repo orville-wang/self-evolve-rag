@@ -1,0 +1,93 @@
+model:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  load_model_path: null
+  max_prompt_aug_num: 2
+  max_inference_aug_num: 0
+
+  weaver:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    prompt_latents_len: 2
+    inference_latents_len: 2
+    lora_config:
+      r: 8
+      lora_alpha: 16
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+  trigger:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    active: False
+    lora_config:
+      r: 8
+      lora_alpha: 16
+      target_modules: ["q_proj", "v_proj"]
+      lora_dropout: 0.1
+      bias: "none"
+      task_type: "CAUSAL_LM"
+
+dataset:
+    name: triviaqa
+    mode: sft  # Use SFT for stable training
+    sft:
+      valid_ratio: 0.1
+    grpo:
+      valid_ratio: 0.1
+
+run:
+  seed: 42
+  mode: train
+  train_weaver: True
+  train_weaver_method: sft
+  train_trigger: False
+  train_trigger_method: grpo
+
+  weaver:
+    sft:
+      num_train_epochs: 2  # 2 epochs for real training
+      per_device_train_batch_size: 1
+      per_device_eval_batch_size: 1
+      gradient_accumulation_steps: 4  # Effective batch size = 4
+
+      optim: adamw_torch
+      lr_scheduler_type: cosine
+      warmup_ratio: 0.1
+      learning_rate: 5e-6
+
+      logging_strategy: steps
+      logging_steps: 10
+      eval_strategy: steps
+      eval_steps: 100
+      save_strategy: steps
+      save_steps: 100
+
+      assistant_only_loss: True
+      max_length: 1024
+      remove_unused_columns: False
+      load_best_model_at_end: True
+      bf16: True
+      report_to:
+        - tensorboard
+        - wandb
+
+  generation:
+    max_turns: 2
+    max_start_length: 256
+    max_prompt_length: 512
+    max_response_length: 128
+    max_obs_length: 128
+    temperature: 0.7
+    eval_batch_size: 1
+
+# Phase 1: Enable memory retrieval and writeback for self-evolution
+memory:
+  enable: true  # Enable memory retrieval
+  store_path: /root/autodl-tmp/real_experience.jsonl
+  index_type: simple
+  topk: 1
+  min_score: 0.3
+  writeback:
+    enable: true  # Continue collecting new experiences
+    min_reward: 0.6
+    require_grounding: false

@@ -114,9 +114,10 @@ class WeaverGRPOTrainer(GRPOTrainer):
         for start in range(0, input_ids.size(0), batch_size):
             input_ids_batch = input_ids[start : start + batch_size]
             attention_mask_batch = attention_mask[start : start + batch_size]
+            labels_batch_input = labels[start : start + batch_size] if labels is not None else None
 
             # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
-            model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch, "labels": labels}
+            model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch, "labels": labels_batch_input}
 
             # Only add logits_to_keep if the model supports it
             if "logits_to_keep" in self.model_kwarg_keys:
@@ -125,8 +126,19 @@ class WeaverGRPOTrainer(GRPOTrainer):
 
             outputs = model(**model_inputs)
             logits = outputs.logits
-            labels = outputs.supervised_labels
-            
+            # Handle both MemGenOutputWithPast and standard CausalLMOutputWithPast
+            if hasattr(outputs, 'supervised_labels'):
+                labels_from_output = outputs.supervised_labels
+            else:
+                # Fallback: use the input labels
+                labels_from_output = labels_batch_input
+
+            # CRITICAL FIX: If labels_from_output is still None, use input_ids as fallback
+            if labels_from_output is None:
+                # Use input_ids as labels (all tokens are supervised)
+                labels_from_output = input_ids_batch.clone()
+                print(f"\n⚠️  FIX APPLIED: labels_from_output was None, using input_ids as fallback\n")
+
             # Exclude the last value: it corresponds to the next token pred
             logits = logits[:, :-1, :]  # (B, L-1, H)
             # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
@@ -138,9 +150,9 @@ class WeaverGRPOTrainer(GRPOTrainer):
             completion_ids = input_ids_batch[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
             all_logps.append(logps)
-            
-            labels = labels[:, -logits_to_keep:]
-            mask = (labels != -100).long()  
+
+            labels_batch = labels_from_output[:, -logits_to_keep:]
+            mask = (labels_batch != -100).long()
             supervise_masks.append(mask)
 
         logps = torch.cat(all_logps, dim=0)
@@ -295,8 +307,15 @@ class WeaverGRPOTrainer(GRPOTrainer):
         completion_ids = final_gen_batch_output.batch["responses"].to(device)  # completion ids
         prompt_completion_ids = final_gen_batch_output.batch["input_ids"].to(device)  # prompt and completion ids
         attention_mask = final_gen_batch_output.batch["attention_mask"].to(device)  # attention_mask on prompt and response
-        prompt_mask = attention_mask[:, :prompts.size(1)]  
-        completion_mask = final_gen_batch_output.batch["info_mask"][:, prompts.size(1):].to(device) 
+        prompt_mask = attention_mask[:, :prompts.size(1)]
+
+        # FIX: If info_mask is all zeros, use attention_mask instead
+        info_mask_raw = final_gen_batch_output.batch["info_mask"].to(device)
+        if info_mask_raw.sum() == 0:
+            print(f"\n⚠️  FIX APPLIED: info_mask was all zeros, using attention_mask instead\n")
+            info_mask_raw = attention_mask.clone()
+
+        completion_mask = info_mask_raw[:, prompts.size(1):]
         is_eos = completion_ids == self.eos_token_id
         assert completion_ids.shape == completion_mask.shape
 
@@ -304,6 +323,37 @@ class WeaverGRPOTrainer(GRPOTrainer):
         prompt_labels = torch.full(prompt_mask.shape, -100, device=device)
         completion_labels = torch.where(completion_mask == 1, completion_ids, -100)
         labels = torch.cat([prompt_labels, completion_labels], dim=1)
+
+        # DEBUG: Check if labels are all -100
+        num_supervised = (labels != -100).sum().item()
+        if num_supervised == 0:
+            print(f"\n{'='*80}")
+            print(f"WARNING: All labels are -100!")
+            print(f"{'='*80}")
+            print(f"completion_mask shape: {completion_mask.shape}")
+            print(f"completion_mask sum: {completion_mask.sum().item()}")
+            print(f"completion_mask sample: {completion_mask[0]}")
+            print(f"completion_ids shape: {completion_ids.shape}")
+            print(f"completion_ids sample: {completion_ids[0]}")
+            print(f"is_eos shape: {is_eos.shape}")
+            print(f"is_eos any: {is_eos.any(dim=1)}")
+
+            # Additional debug: check info_mask
+            print(f"\nDEBUG info_mask:")
+            info_mask_full = final_gen_batch_output.batch["info_mask"]
+            print(f"info_mask shape: {info_mask_full.shape}")
+            print(f"info_mask sum: {info_mask_full.sum().item()}")
+            print(f"info_mask sample: {info_mask_full[0]}")
+
+            # Check responses_with_info_mask
+            if "responses_with_info_mask" in final_gen_batch_output.batch:
+                resp_with_mask = final_gen_batch_output.batch["responses_with_info_mask"]
+                print(f"\nresponses_with_info_mask shape: {resp_with_mask.shape}")
+                print(f"responses_with_info_mask sample: {resp_with_mask[0]}")
+                print(f"Pad token ID: {self.processing_class.pad_token_id}")
+                print(f"Number of pad tokens: {(resp_with_mask[0] == self.processing_class.pad_token_id).sum()}")
+
+            print(f"{'='*80}\n")
         
         # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
         # to re-tokenize completions if the reward is computed from tokens.
@@ -441,7 +491,13 @@ class WeaverGRPOTrainer(GRPOTrainer):
         completion_labels = torch.where(completion_mask == 1, completion_ids, -100)
         labels = torch.cat([prompt_labels, completion_labels], dim=1)
         logits_to_keep = completion_labels.size(1)
-        
+
+        # DEBUG: Check labels
+        if labels is None:
+            print(f"\n❌ ERROR: labels is None!")
+        else:
+            print(f"\n✓ labels shape: {labels.shape}, non-(-100) count: {(labels != -100).sum()}")
+
         assert prompt_ids.shape == prompt_mask.shape
         assert completion_ids.shape == completion_mask.shape
         assert input_ids.shape == attention_mask.shape == labels.shape

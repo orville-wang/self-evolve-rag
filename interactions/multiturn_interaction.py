@@ -17,9 +17,10 @@ class MultiTurnInteractionManager(InteractionManager):
         actor_rollout_wg,
         config: InteractionConfig,
         is_validation: bool = False,
+        memory_store: object = None,
     ):
         super().__init__(
-            tokenizer, actor_rollout_wg, config, is_validation
+            tokenizer, actor_rollout_wg, config, is_validation, memory_store
         )
         # generation configs for agent
         self.generation_config = GenerationConfig(
@@ -133,6 +134,10 @@ class MultiTurnInteractionManager(InteractionManager):
             # use tokenizer to add chat template and encode text to tokens: input_ids, attention_mask
             messages = self._build_chat_history(rollings_active)
             self.tokenizer.padding_side = "left"
+            memory_texts = None
+            if self.memory_store is not None:
+                prompt_texts = [history[-1]["content"] if history else "" for history in messages]
+                memory_texts = self._lookup_memory_texts(prompt_texts)
             inputs = self.tokenizer.apply_chat_template(
                 messages, tokenize=True, 
                 add_generation_prompt=True, 
@@ -144,6 +149,7 @@ class MultiTurnInteractionManager(InteractionManager):
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 generation_config=self.generation_config,
+                memory_texts=memory_texts,
             ).to("cpu")
 
             # postprocess

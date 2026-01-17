@@ -1,5 +1,5 @@
 import logging
-from typing import Union, Optional
+from typing import Union, Optional, List
 
 import random
 import torch
@@ -45,18 +45,26 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         if trigger_model is None:
             trigger_model = base_model
 
-        fix_model_parameters(base_model)  
+        fix_model_parameters(base_model)
         fix_model_parameters(weaver_model)
         fix_model_parameters(trigger_model)
+
+        # Get the target dtype from base model before LoRA insertion
+        target_dtype = next(base_model.parameters()).dtype
 
         weaver_model, trigger_model = self._insert_lora_adapters(
             weaver_model, config.weaver_lora_config, trigger_model, config.trigger_lora_config,
         )
+
+        # Ensure weaver and trigger models use the same dtype as base model
+        weaver_model = weaver_model.to(target_dtype)
+        trigger_model = trigger_model.to(target_dtype)
+
         self.weaver = MemGenWeaver(
-            weaver_model, config.prompt_latents_len, config.inference_latents_len, 
+            weaver_model, config.prompt_latents_len, config.inference_latents_len,
         )
         self.trigger = MemGenTrigger(
-            trigger_model, config.trigger_active, 
+            trigger_model, config.trigger_active,
         )
         self.reasoner = base_model
         self.tokenizer = base_tokenizer
@@ -65,12 +73,16 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         # map reasoner input embeddings to weaver input embeddings
         reasoner_hidden_size = self.config.hidden_size
         weaver_hidden_size = weaver_model.base_model.config.hidden_size
+
+        # Get the dtype from the base model
+        model_dtype = next(base_model.parameters()).dtype
+
         self.reasoner_to_weaver = nn.Linear(
-            reasoner_hidden_size, weaver_hidden_size
+            reasoner_hidden_size, weaver_hidden_size, dtype=model_dtype
         )
         # Map weaver hidden states to reasoner input embeddings
         self.weaver_to_reasoner = nn.Linear(
-            weaver_hidden_size, reasoner_hidden_size
+            weaver_hidden_size, reasoner_hidden_size, dtype=model_dtype
         )
         
         self.delimiters: list[str] = [",", ".", "\n"]  # delimiters for detecting augmentation points
@@ -326,10 +338,12 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         
         # Determine whether the input is single-turn (instruction) or multi-turn (conversation)
         forward_func = self._instructional_forward
-        if self._is_conversation(input_ids, tokenizer):
-            # For conversational data, mask assistant tokens in labels
-            labels = self._postprocess_assistant_labels(input_ids, labels, tokenizer)
-            forward_func = self._conversational_forward
+        # DISABLED: Force use of instructional forward for GRPO training
+        # The conversational forward expects specific label patterns that GRPO doesn't provide
+        # if self._is_conversation(input_ids, tokenizer):
+        #     # For conversational data, mask assistant tokens in labels
+        #     labels = self._postprocess_assistant_labels(input_ids, labels, tokenizer)
+        #     forward_func = self._conversational_forward
         
         batch_size = 1  # Currently process one sequence per batch
         iter_num = input_ids.size(0) // batch_size
@@ -374,6 +388,7 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         attention_mask: torch.Tensor,
         generation_config: GenerationConfig = None, 
         return_augmentation_mask: bool = False,
+        memory_texts: Optional[List[Optional[str]]] = None,
         **kwargs
     ) -> Union[torch.LongTensor, tuple[torch.LongTensor, torch.LongTensor]]: 
         
@@ -394,6 +409,34 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         inputs_embeds = reasoner.get_input_embeddings()(input_ids)
         B, _, hidden_size = inputs_embeds.shape
         device = inputs_embeds.device
+
+        memory_available = None
+        memory_weaver_embeds: Optional[List[Optional[torch.Tensor]]] = None
+        if memory_texts is not None:
+            if len(memory_texts) != B:
+                raise ValueError(
+                    f"memory_texts length ({len(memory_texts)}) does not match batch size ({B})"
+                )
+            memory_available = torch.zeros(B, dtype=torch.bool, device=device)
+            memory_weaver_embeds = [None] * B
+            max_memory_tokens = getattr(self.config, "memory_max_length", 128)
+            for idx, text in enumerate(memory_texts):
+                if not text:
+                    continue
+                mem_inputs = tokenizer(
+                    text,
+                    return_tensors="pt",
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=max_memory_tokens,
+                )
+                mem_ids = mem_inputs["input_ids"].to(device)
+                mem_embeds = reasoner.get_input_embeddings()(mem_ids)
+                mem_embeds = self.reasoner_to_weaver(mem_embeds).squeeze(0)
+                if mem_embeds.numel() == 0:
+                    continue
+                memory_weaver_embeds[idx] = mem_embeds
+                memory_available[idx] = True
         
         # --- generation loop ---
         current_inputs_embeds = inputs_embeds
@@ -421,6 +464,12 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 temperature=generation_config.temperature,
                 is_prompt=(i==0)  
             )
+            if memory_available is not None:
+                no_memory_mask = ~memory_available
+                if no_memory_mask.any():
+                    augment_decision = augment_decision.clone()
+                    aug_mask = no_memory_mask & (augment_decision == 1)
+                    augment_decision[aug_mask] = 0
             augmentation_pos[:, i] = augment_decision
             augment_indices = torch.where(augment_decision == 1)[0]
 
@@ -433,20 +482,48 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 # Select embeddings, attention masks, and position IDs for sentences to be augmented
                 candidate_inputs_embeds = current_inputs_embeds[augment_indices]
                 candidate_attention_mask = current_attention_mask[augment_indices]
-                candidate_position_ids = current_position_ids[augment_indices]
-                
+
                 # Perform inference augmentation using the weaver
                 weaver_inputs_embeds = self.reasoner_to_weaver(candidate_inputs_embeds)
+                weaver_attention_mask = candidate_attention_mask
+                if memory_weaver_embeds is not None:
+                    mem_lengths = []
+                    for idx in augment_indices.tolist():
+                        mem = memory_weaver_embeds[idx]
+                        mem_lengths.append(mem.size(0) if mem is not None else 0)
+                    max_mem_len = max(mem_lengths) if mem_lengths else 0
+                    if max_mem_len > 0:
+                        mem_tensor = torch.zeros(
+                            (len(augment_indices), max_mem_len, weaver_inputs_embeds.size(-1)),
+                            device=device,
+                            dtype=weaver_inputs_embeds.dtype,
+                        )
+                        mem_mask = torch.zeros(
+                            (len(augment_indices), max_mem_len),
+                            device=device,
+                            dtype=weaver_attention_mask.dtype,
+                        )
+                        for row, idx in enumerate(augment_indices.tolist()):
+                            mem = memory_weaver_embeds[idx]
+                            if mem is None:
+                                continue
+                            mem_len = mem.size(0)
+                            mem_tensor[row, :mem_len, :] = mem
+                            mem_mask[row, :mem_len] = 1
+                        weaver_inputs_embeds = torch.cat([weaver_inputs_embeds, mem_tensor], dim=1)
+                        weaver_attention_mask = torch.cat([weaver_attention_mask, mem_mask], dim=1)
+
+                weaver_position_ids = self._generate_position_ids(weaver_attention_mask)
                 if i == 0:
                     weaver_hidden_states, attn_mask, _ = weaver.augment_prompt(
-                        weaver_inputs_embeds, candidate_attention_mask, candidate_position_ids
+                        weaver_inputs_embeds, weaver_attention_mask, weaver_position_ids
                     )                    
                 else:
                     weaver_hidden_states, attn_mask, _ = weaver.augment_inference(
-                        weaver_inputs_embeds, candidate_attention_mask, candidate_position_ids
+                        weaver_inputs_embeds, weaver_attention_mask, weaver_position_ids
                     )
                 latent_inputs_embeds = self.weaver_to_reasoner(weaver_hidden_states)
-                
+
                 candidate_inputs_embeds = torch.cat([candidate_inputs_embeds, latent_inputs_embeds], dim=1)
                 candidate_attention_mask = torch.cat([candidate_attention_mask, attn_mask], dim=1)
                 
@@ -545,7 +622,147 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             return (current_input_ids, augmentation_pos)
         else:
             return current_input_ids
-    
+
+    def save_pretrained(
+        self,
+        save_directory: str,
+        is_main_process: bool = True,
+        state_dict: Optional[dict] = None,
+        save_function = None,
+        push_to_hub: bool = False,
+        max_shard_size: Union[int, str] = "5GB",
+        safe_serialization: bool = True,
+        variant: Optional[str] = None,
+        token: Optional[Union[str, bool]] = None,
+        save_peft_format: bool = True,
+        **kwargs,
+    ):
+        """
+        Custom save_pretrained to handle shared tensors between reasoner, weaver, and trigger.
+
+        Only saves trainable parameters (LoRA weights and projection layers) to avoid
+        the shared tensor issue.
+        """
+        import os
+        from safetensors.torch import save_file
+
+        if os.path.isfile(save_directory):
+            logging.error(f"Provided path ({save_directory}) should be a directory, not a file")
+            return
+
+        os.makedirs(save_directory, exist_ok=True)
+
+        # Save config
+        self.config.save_pretrained(save_directory)
+
+        # Collect only trainable parameters (LoRA weights and projection layers)
+        state_dict_to_save = {}
+
+        # Save projection layers (always trainable)
+        state_dict_to_save['reasoner_to_weaver.weight'] = self.reasoner_to_weaver.weight.detach().clone().cpu()
+        state_dict_to_save['reasoner_to_weaver.bias'] = self.reasoner_to_weaver.bias.detach().clone().cpu()
+        state_dict_to_save['weaver_to_reasoner.weight'] = self.weaver_to_reasoner.weight.detach().clone().cpu()
+        state_dict_to_save['weaver_to_reasoner.bias'] = self.weaver_to_reasoner.bias.detach().clone().cpu()
+
+        # Save weaver LoRA weights (if trainable)
+        # Use a set to track saved parameter IDs to avoid duplicates
+        saved_param_ids = set()
+
+        for name, param in self.weaver.named_parameters():
+            if param.requires_grad and 'lora' in name.lower():
+                param_id = id(param)
+                if param_id not in saved_param_ids:
+                    state_dict_to_save[f'weaver.{name}'] = param.detach().clone().cpu()
+                    saved_param_ids.add(param_id)
+
+        # Save trigger LoRA weights (if trainable and not already saved)
+        for name, param in self.trigger.named_parameters():
+            if param.requires_grad and 'lora' in name.lower():
+                param_id = id(param)
+                if param_id not in saved_param_ids:
+                    state_dict_to_save[f'trigger.{name}'] = param.detach().clone().cpu()
+                    saved_param_ids.add(param_id)
+
+        # Save using safetensors
+        if safe_serialization:
+            save_file(state_dict_to_save, os.path.join(save_directory, "model.safetensors"))
+            logging.info(f"Model weights saved to {os.path.join(save_directory, 'model.safetensors')}")
+        else:
+            torch.save(state_dict_to_save, os.path.join(save_directory, "pytorch_model.bin"))
+            logging.info(f"Model weights saved to {os.path.join(save_directory, 'pytorch_model.bin')}")
+
+        # Save tokenizer
+        if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+            self.tokenizer.save_pretrained(save_directory)
+            logging.info(f"Tokenizer saved to {save_directory}")
+
+        logging.info(f"Saved {len(state_dict_to_save)} trainable parameters to {save_directory}")
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        config: MemGenConfig = None,
+        base_model: PreTrainedModel = None,
+        base_tokenizer = None,
+        weaver_model: PreTrainedModel = None,
+        trigger_model: PreTrainedModel = None,
+        **kwargs,
+    ):
+        """
+        Load a MemGenModel from a pretrained checkpoint.
+
+        This method loads only the trainable parameters (LoRA weights and projection layers)
+        that were saved by save_pretrained.
+        """
+        import os
+        from safetensors.torch import load_file
+
+        # Initialize the model with base models
+        model = cls(
+            config=config,
+            base_model=base_model,
+            base_tokenizer=base_tokenizer,
+            weaver_model=weaver_model,
+            trigger_model=trigger_model
+        )
+
+        # Load saved weights
+        safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+        pytorch_path = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
+
+        if os.path.exists(safetensors_path):
+            state_dict = load_file(safetensors_path)
+            logging.info(f"Loading weights from {safetensors_path}")
+        elif os.path.exists(pytorch_path):
+            state_dict = torch.load(pytorch_path, map_location='cpu')
+            logging.info(f"Loading weights from {pytorch_path}")
+        else:
+            logging.warning(f"No saved weights found in {pretrained_model_name_or_path}, using initialized weights")
+            return model
+
+        # Load projection layers
+        if 'reasoner_to_weaver.weight' in state_dict:
+            model.reasoner_to_weaver.weight.data = state_dict['reasoner_to_weaver.weight'].to(model.device)
+            model.reasoner_to_weaver.bias.data = state_dict['reasoner_to_weaver.bias'].to(model.device)
+            model.weaver_to_reasoner.weight.data = state_dict['weaver_to_reasoner.weight'].to(model.device)
+            model.weaver_to_reasoner.bias.data = state_dict['weaver_to_reasoner.bias'].to(model.device)
+
+        # Load weaver LoRA weights
+        weaver_params = {k.replace('weaver.', ''): v for k, v in state_dict.items() if k.startswith('weaver.')}
+        if weaver_params:
+            model.weaver.load_state_dict(weaver_params, strict=False)
+            logging.info(f"Loaded {len(weaver_params)} weaver parameters")
+
+        # Load trigger LoRA weights
+        trigger_params = {k.replace('trigger.', ''): v for k, v in state_dict.items() if k.startswith('trigger.')}
+        if trigger_params:
+            model.trigger.load_state_dict(trigger_params, strict=False)
+            logging.info(f"Loaded {len(trigger_params)} trigger parameters")
+
+        logging.info(f"Successfully loaded model from {pretrained_model_name_or_path}")
+        return model
+
     @classmethod
     def from_config(cls, config_dict: dict):
         # base LLM
@@ -570,10 +787,9 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
 
         # 构造 MemGenConfig
         from transformers import AutoConfig
-        memgen_config = AutoConfig.from_pretrained(model_name)
+        base_config = AutoConfig.from_pretrained(model_name)
         memgen_config = MemGenConfig.from_pretrained(
-            model_name, 
-
+            model_name,
             max_prompt_aug_num=max_prompt_aug_num,
             max_inference_aug_num=max_inference_aug_num,
             # weaver
@@ -584,17 +800,21 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             trigger_active=trigger_active,
             trigger_lora_config=trigger_lora_config_dict
         )
+
+        # Ensure _name_or_path is set for GRPO compatibility
+        if not memgen_config._name_or_path:
+            memgen_config._name_or_path = model_name
         
-        base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+        base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, attn_implementation="eager")
         base_tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         if weaver_model_name != model_name:
-            weaver_model = AutoModelForCausalLM.from_pretrained(weaver_model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+            weaver_model = AutoModelForCausalLM.from_pretrained(weaver_model_name, torch_dtype=torch.float32, attn_implementation="eager")
         else:
             weaver_model = base_model
-        
+
         if trigger_model_name != model_name:
-            trigger_model = AutoModelForCausalLM.from_pretrained(trigger_model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+            trigger_model = AutoModelForCausalLM.from_pretrained(trigger_model_name, torch_dtype=torch.float32, attn_implementation="eager")
         else:
             trigger_model = base_model
         
@@ -618,4 +838,3 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             )
         
         return model
-

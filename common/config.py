@@ -15,10 +15,11 @@ class Config:
         runner_config = self.build_runner_config(config, **user_config)
         model_config = self.build_model_config(config, **user_config)
         dataset_config = self.build_dataset_config(config, **user_config)
+        memory_config = self.build_memory_config(config, **user_config)
 
         # Override the default configuration with user options.
         self.config = OmegaConf.merge(  
-            runner_config, model_config, dataset_config, user_config
+            runner_config, model_config, dataset_config, memory_config, user_config
         )
     
 
@@ -43,6 +44,13 @@ class Config:
             )
         
         return dict(dataset=dataset)
+
+    @staticmethod
+    def build_memory_config(config, **kwargs):
+        memory = config.get("memory", None)
+        if memory is None:
+            return {}
+        return dict(memory=memory)
     
     def _convert_to_dot_list(self, opts):
         if opts is None:
@@ -82,6 +90,9 @@ class Config:
 
         logging.info(f"\n======  Model Attributes  ======")
         logging.info(self._convert_node_to_json(self.config.model))
+        if "memory" in self.config:
+            logging.info(f"\n======  Memory Attributes  ======")
+            logging.info(self._convert_node_to_json(self.config.memory))
     
     def _convert_node_to_json(self, node):
         container = OmegaConf.to_container(node, resolve=True)  

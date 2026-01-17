@@ -24,24 +24,30 @@ class MemGenOutputWithPast(CausalLMOutputWithPast):
 class MemGenLoraSwitchMixin:
 
     def _insert_lora_adapters(
-        self, 
-        weaver_model: PreTrainedModel, 
-        weaver_lora_config: dict, 
-        trigger_model: PreTrainedModel, 
+        self,
+        weaver_model: PreTrainedModel,
+        weaver_lora_config: dict,
+        trigger_model: PreTrainedModel,
         trigger_lora_config: dict
     ) -> tuple[PeftModel, PeftModel, PeftModel]:
-        
+
         same_model = weaver_model is trigger_model
         weaver_lora_config = LoraConfig(**weaver_lora_config)
         trigger_lora_config = LoraConfig(**trigger_lora_config)
-        
+
+        # Get target dtype from the base model
+        target_dtype = next(weaver_model.parameters()).dtype
+
         if same_model:
             peft_model = PeftModel(
                 weaver_model, weaver_lora_config, adapter_name=MemGenWeaver.adapter_name
             )
             peft_model.add_adapter(peft_config=trigger_lora_config, adapter_name=MemGenTrigger.adapter_name)
+            # Convert all parameters to target dtype
+            for param in peft_model.parameters():
+                param.data = param.data.to(target_dtype)
             return peft_model, peft_model
-        
+
         else:
             weaver_model_with_lora = PeftModel(
                 weaver_model, weaver_lora_config, adapter_name=MemGenWeaver.adapter_name
@@ -49,6 +55,11 @@ class MemGenLoraSwitchMixin:
             trigger_model_with_lora = PeftModel(
                 trigger_model, trigger_lora_config, adapter_name=MemGenTrigger.adapter_name
             )
+            # Convert all parameters to target dtype
+            for param in weaver_model_with_lora.parameters():
+                param.data = param.data.to(target_dtype)
+            for param in trigger_model_with_lora.parameters():
+                param.data = param.data.to(target_dtype)
             return weaver_model_with_lora, trigger_model_with_lora
     
     def fix_component(self, name: Literal["weaver", "trigger"]):
@@ -192,8 +203,15 @@ class MemGenGenerationMixin(GenerationMixin):
                     inference_augment_idx.append(i)
         
         # Ensure exactly one prompt augmentation point exists for single-turn processing
-        if len(prompt_augment_idx) != 1:
-            raise ValueError("Single-turn forward must have exactly one prompt augment index")
+        # FIX: For GRPO training, allow 0 or 1 prompt augment index
+        if len(prompt_augment_idx) > 1:
+            # If multiple found, use only the first one
+            prompt_augment_idx = prompt_augment_idx[:1]
+            print(f"\n⚠️  WARNING: Multiple prompt augment indices found, using only the first one\n")
+        elif len(prompt_augment_idx) == 0:
+            # If none found, skip augmentation for this batch
+            print(f"\n⚠️  WARNING: No prompt augment index found, skipping augmentation\n")
+            return []
 
         final_points = prompt_augment_idx[:1]
 

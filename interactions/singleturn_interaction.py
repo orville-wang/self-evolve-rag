@@ -16,9 +16,10 @@ class SingleTurnInteractionManager(InteractionManager):
         actor_rollout_wg,
         config: InteractionConfig,
         is_validation: bool = False,
+        memory_store: object = None,
     ):
         super().__init__(
-            tokenizer, actor_rollout_wg, config, is_validation
+            tokenizer, actor_rollout_wg, config, is_validation, memory_store
         )
         # generation configs for agent
         self.generation_config = GenerationConfig(
@@ -106,10 +107,16 @@ class SingleTurnInteractionManager(InteractionManager):
         }  
 
         # model generation
+        memory_texts = None
+        if self.memory_store is not None:
+            prompt_texts = self._extract_prompt_texts(gen_batch, rollings_active["input_ids"])
+            memory_texts = self._lookup_memory_texts(prompt_texts)
+
         gen_output = self.actor_rollout_wg.generate(
             rollings_active["input_ids"], 
             rollings_active["attention_mask"], 
-            generation_config=self.generation_config
+            generation_config=self.generation_config,
+            memory_texts=memory_texts,
         )
         responses_ids = gen_output[:, rollings_active["input_ids"].size(1):]
         responses_ids = self.tensor_fn.erase_after_first_eos(responses_ids, self.tokenizer.eos_token_id)
@@ -119,17 +126,24 @@ class SingleTurnInteractionManager(InteractionManager):
         
         # construct final output
         return self._compose_final_output(original_left_side, original_right_side)
+
+    def _extract_prompt_texts(self, gen_batch: InteractionDataProto, input_ids: torch.Tensor) -> List[str]:
+        if "initial_prompts" in gen_batch.no_tensor_batch:
+            return list(gen_batch.no_tensor_batch["initial_prompts"])
+        if "prompt" in gen_batch.no_tensor_batch:
+            return list(gen_batch.no_tensor_batch["prompt"])
+        return self.tokenizer.batch_decode(input_ids.detach().cpu(), skip_special_tokens=True)
     
     def _compose_final_output(
         self, left_side: Dict,
         right_side: Dict,
     ) -> InteractionDataProto:
         """Compose final generation output."""
-        
+
         final_output_batch = right_side.copy()
         final_output_batch['prompts'] = left_side['input_ids']
         final_output_batch["responses"] = right_side['responses']
-        
+
         # Combine input IDs: input_ids + responses
         final_output_batch['input_ids'] = torch.cat([
             left_side['input_ids'],
@@ -141,12 +155,11 @@ class SingleTurnInteractionManager(InteractionManager):
             self.tensor_fn.create_attention_mask(left_side['input_ids']),
             self.tensor_fn.create_attention_mask(final_output_batch['responses'])
         ], dim=1)
-        
-        final_output_batch['info_mask'] = torch.cat([  
-            self.tensor_fn.create_attention_mask(left_side['input_ids']),
-            self.tensor_fn.create_attention_mask(final_output_batch['responses_with_info_mask'])
-        ], dim=1)
-        
+
+        # SIMPLIFIED FIX: Use attention_mask as info_mask
+        # In single-turn scenarios without observations, all tokens should be supervised
+        final_output_batch['info_mask'] = final_output_batch['attention_mask'].clone()
+
         final_output = InteractionDataProto(batch=final_output_batch)
 
         return final_output
